@@ -37,7 +37,7 @@ import java.util.concurrent.Executors;
  * Home screen picks ("This morning / afternoon / tonight"): what's trending this week plus recent releases, only from
  * the streaming apps installed on the TV (Netflix, Prime Video, Disney+, Max, Apple TV, Okko, Hulu, Paramount+, Peacock,
  * Globoplay...), via TMDB (an open movie database that knows what streams where in each country). Three per hour.
- * "Watch" opens the service's app.
+ * "Watch" opens the service's app. Picks from your own Jellyfin server come first (Jellyfin.java).
  *
  * Each person uses their own free TMDB key (config.properties "tmdb_key", built into the app). It never goes to the log.
  */
@@ -48,6 +48,8 @@ final class Recs {
         String title, backdrop, meta = "", app, pkg;
         String link;            // opens the title in its app (looked up with Watchmode), or null: the app's home
         boolean detailed;
+        String item;            // Jellyfin: the title's id on your server (null for TMDB's picks)
+        boolean resume;         // Jellyfin: you're in the middle of it
         java.io.File photo;     // one of your own photos (Photos): no title, no caption
     }
 
@@ -58,7 +60,7 @@ final class Recs {
     private static final String IMAGES = "https://image.tmdb.org/t/p/" + (Backdrop.W <= 1280 ? "w1280" : "original");
     /** TMDB's Animation genre (movies and shows: cartoons and anime), left out with hide_animation=true. */
     private static final int ANIMATION = 16;
-    private static final long LIST_EVERY = 6 * 3600_000L;
+    private static final long LIST_EVERY = 6 * 3600_000L, JELLYFIN_EVERY = 5 * 60_000L;
     /** Bump when what is saved for each title changes (the saved list is discarded and fetched again). */
     private static final int CACHE_VERSION = 4;
     private static final int MANHA = 0, TARDE = 1, NOITE = 2;
@@ -100,6 +102,7 @@ final class Recs {
         SERVICE_NAME.put("okko", "Okko");
         SERVICE_NAME.put("crunchyroll", "Crunchyroll");
         SERVICE_NAME.put("oneplay", "Oneplay");
+        SERVICE_NAME.put("jellyfin", "Jellyfin");
     }
     /** Country for "what streams where" (config.properties "tmdb_region", e.g. US, GB, BR). */
     static final String REGION = Config.TMDB_REGION.trim().toUpperCase(Locale.ROOT);
@@ -121,7 +124,9 @@ final class Recs {
     private final List<Listener> listeners = new ArrayList<>();
     private final Map<String, Backdrop> images = new LinkedHashMap<>();   // this hour's, built and ready to draw
     private final java.util.Set<String> pending = new java.util.HashSet<>();
-    private volatile List<Pick> picks = new ArrayList<>();
+    private volatile List<Pick> picks = new ArrayList<>();   // TMDB's (saved); Jellyfin's are fetched on each start
+    private volatile List<Pick> jellyfin = new ArrayList<>();
+    private volatile long jellyfinAt;
     private volatile int period = -1;
     private volatile long listAt;
     private volatile boolean fetching;
@@ -150,6 +155,11 @@ final class Recs {
 
     static boolean hasKey(Context c) {
         return !Config.TMDB_KEY.trim().isEmpty();
+    }
+
+    /** Picks on the home screen: from TMDB (with a key) and/or your Jellyfin server. */
+    static boolean on(Context c) {
+        return hasKey(c) || Jellyfin.ON;
     }
 
     /** Last fetch, for the settings screen: {count, error, at}. Written by the home screen (another process). */
@@ -193,9 +203,8 @@ final class Recs {
     /** This hour's 3, movies only ("movie") or shows only ("tv"); null = both (the home screen tabs). */
     List<Pick> now(String kind) {
         List<Pick> list = new ArrayList<>();
-        if (!hasKey(context)) return list;    // no TMDB key: no recommendations
         Map<String, Boolean> have = new HashMap<>();   // one look per app, not per title (this runs every 15 s)
-        for (Pick p : picks) {
+        for (Pick p : all()) {
             if ((kind == null || kind.equals(p.kind))
                     && (!p.detailed || (p.pkg != null && have.computeIfAbsent(p.pkg, this::installed)))) list.add(p);   // app missing: skip
         }
@@ -204,11 +213,26 @@ final class Recs {
         // Three per hour, never two from the same franchise ("Law & Order" and "Law & Order: Special…").
         List<Pick> out = new ArrayList<>();
         java.util.Set<String> seen = new java.util.HashSet<>();
+        // What you're in the middle of on Jellyfin comes first, every hour.
+        for (Pick p : list) {
+            if (p.resume && seen.add(franchise(p.title))) {
+                out.add(p);
+                break;
+            }
+        }
         for (int i = 0; i < list.size() && out.size() < 3; i++) {
             Pick p = list.get((int) ((hour * 3 + i) % list.size()));
             if (seen.add(franchise(p.title))) out.add(p);
         }
         return out;
+    }
+
+    /** Jellyfin's picks, then TMDB's (only with a key: without one, the saved list is left over from an old build). */
+    private List<Pick> all() {
+        if (!hasKey(context)) return jellyfin;
+        List<Pick> all = new ArrayList<>(jellyfin);
+        all.addAll(picks);
+        return all;
     }
 
     /** "Law & Order: Special Victims Unit" → "law & order" (what comes before ":" or " - "). */
@@ -248,56 +272,93 @@ final class Recs {
     }
 
     private File imageFile(Pick p) {
-        return new File(new File(context.getCacheDir(), "recs"), p.backdrop.replace("/", ""));
+        // TMDB's "/abc.jpg" → "abc.jpg"; a Jellyfin URL loses its ":/?&=" the same way.
+        return new File(new File(context.getCacheDir(), "recs"), p.backdrop.replaceAll("[^\\w.-]", ""));
     }
 
-    /** With a key: fetches the list if stale or the time of day (morning/afternoon/night) changed; then the details. */
+    /**
+     * Jellyfin's list every 5 minutes (it's on your network, and what you're watching changes). With a TMDB key, its
+     * list if stale or the time of day (morning/afternoon/night) changed; then this hour's details.
+     */
     void refreshIfStale() {
-        if (!hasKey(context) || fetching) return;
+        if (fetching) return;
         long now = System.currentTimeMillis();
-        long stamp = sourceStamp();   // a new key, country, animation choice or installed streaming-app set refetches
-        boolean newKey = stamp != keyStamp;
-        long sinceFail = now - failedAt;    // negative = the clock went back: don't wait
-        if (!newKey && failedAt != 0 && sinceFail >= 0 && sinceFail < 10 * 60_000L) return;
+        boolean jf = Jellyfin.ON && (now - jellyfinAt > JELLYFIN_EVERY || now < jellyfinAt);
+        boolean tmdb = false, stale = false;
         int p = period(now);
-        boolean stale = newKey || p != period || now - listAt > LIST_EVERY || now < listAt || picks.isEmpty()
-                || !listLanguage.equals(Ui.language);
-        boolean missing = false;
-        for (Pick pick : wanted()) missing |= !pick.detailed || !hasImage(pick) || needsLink(pick);
-        if (!stale && !missing) return;
-        keyStamp = stamp;
+        long stamp = keyStamp;
+        if (hasKey(context)) {
+            stamp = sourceStamp();   // a new key, country, animation choice or installed streaming-app set refetches
+            boolean newKey = stamp != keyStamp;
+            long sinceFail = now - failedAt;    // negative = the clock went back: don't wait
+            boolean waiting = !newKey && failedAt != 0 && sinceFail >= 0 && sinceFail < 10 * 60_000L;
+            stale = newKey || p != period || now - listAt > LIST_EVERY || now < listAt || picks.isEmpty()
+                    || !listLanguage.equals(Ui.language);
+            boolean missing = false;
+            for (Pick pick : wanted()) missing |= pick.item == null && (!pick.detailed || !hasImage(pick) || needsLink(pick));
+            tmdb = !waiting && (stale || missing);
+        }
+        if (!jf && !tmdb) return;
+        if (tmdb) keyStamp = stamp;
+        final boolean fetchJellyfin = jf, fetchTmdb = tmdb, fetchList = stale;
         fetching = true;
         io.execute(() -> {
             try {
-                if (stale) fetchList(p);
-                // One failing title doesn't stop the others; whatever has no app on the TV is not downloaded.
-                int failures = 0, tried = 0;
-                String last = "";
-                for (Pick pick : wanted()) {
-                    tried++;
-                    try {
-                        if (!pick.detailed) fetchDetails(pick);
-                        if (pick.pkg != null) download(pick);
-                    } catch (Exception e) {
-                        failures++;
-                        last = e.getMessage() == null ? e.toString() : e.getMessage();
-                    }
-                    findLink(pick);
-                }
-                save();
-                if (tried > 0 && failures == tried) throw new IOException(last);
-                error = "";
-                failedAt = 0;
-            } catch (Exception e) {
-                error = e.getMessage() == null ? e.toString() : e.getMessage();
-                failedAt = System.currentTimeMillis();
-                AppLog.w("recommendations: " + error);
+                if (fetchJellyfin) refreshJellyfin();
+                if (fetchTmdb) refreshTmdb(fetchList, p);
             } finally {
                 fetching = false;
                 writeStatus();
                 notifyListeners();
             }
         });
+    }
+
+    /** Keeps the last list if the server doesn't answer (it's off, or the TV is on another network). */
+    private void refreshJellyfin() {
+        try {
+            List<Pick> list = Jellyfin.picks();
+            for (Pick p : list) {
+                try {
+                    download(p);    // all of them, not just this hour's: they're on your network, and the screensaver shows them
+                } catch (IOException e) {
+                    AppLog.w("jellyfin image: " + e.getMessage());
+                }
+            }
+            jellyfin = list;
+        } catch (Exception e) {
+            AppLog.w("jellyfin: " + (e.getMessage() == null ? e.toString() : e.getMessage()));
+        }
+        jellyfinAt = System.currentTimeMillis();
+    }
+
+    private void refreshTmdb(boolean stale, int p) {
+        try {
+            if (stale) fetchList(p);
+            // One failing title doesn't stop the others; whatever has no app on the TV is not downloaded.
+            int failures = 0, tried = 0;
+            String last = "";
+            for (Pick pick : wanted()) {
+                if (pick.item != null) continue;   // Jellyfin's: already done
+                tried++;
+                try {
+                    if (!pick.detailed) fetchDetails(pick);
+                    if (pick.pkg != null) download(pick);
+                } catch (Exception e) {
+                    failures++;
+                    last = e.getMessage() == null ? e.toString() : e.getMessage();
+                }
+                findLink(pick);
+            }
+            save();
+            if (tried > 0 && failures == tried) throw new IOException(last);
+            error = "";
+            failedAt = 0;
+        } catch (Exception e) {
+            error = e.getMessage() == null ? e.toString() : e.getMessage();
+            failedAt = System.currentTimeMillis();
+            AppLog.w("recommendations: " + error);
+        }
     }
 
     /** Home screen design: the ready images are rebuilt for it (the light design uses cards, not the whole photo). */
@@ -315,11 +376,10 @@ final class Recs {
      */
     List<Pick> showcase() {
         List<Pick> out = new ArrayList<>();
-        if (!hasKey(context)) return out;
         java.util.Set<String> seen = new java.util.HashSet<>();
         for (Pick p : wanted()) if (hasImage(p) && seen.add(franchise(p.title))) out.add(p);
         Map<String, Boolean> have = new HashMap<>();
-        for (Pick p : picks) {
+        for (Pick p : all()) {
             if (p.detailed && p.pkg != null && have.computeIfAbsent(p.pkg, this::installed) && hasImage(p)
                     && seen.add(franchise(p.title))) out.add(p);
         }
@@ -382,7 +442,7 @@ final class Recs {
 
     /** Movies and shows are numbered separately on TMDB: a pick is identified by type + number. */
     static String key(Pick p) {
-        return p.kind + ":" + p.id;
+        return p.item != null ? "jellyfin:" + p.item : p.kind + ":" + p.id;
     }
 
     private void notifyListeners() {
@@ -718,7 +778,7 @@ final class Recs {
         //noinspection ResultOfMethodCallIgnored
         f.getParentFile().mkdirs();
         File part = new File(f.getPath() + ".part");
-        HttpURLConnection c = (HttpURLConnection) new URL(IMAGES + p.backdrop).openConnection();
+        HttpURLConnection c = (HttpURLConnection) new URL(p.item != null ? p.backdrop : IMAGES + p.backdrop).openConnection();
         c.setConnectTimeout(8000);
         c.setReadTimeout(20000);
         try (InputStream in = c.getInputStream(); FileOutputStream out = new FileOutputStream(part)) {
@@ -786,9 +846,10 @@ final class Recs {
             if (parts[i].lastModified() < stale) parts[i].delete();
         }
         File[] files = dir.listFiles((d, name) -> !name.endsWith(".part"));
-        if (files == null || files.length <= 24) return;
+        // TMDB's 24 and Jellyfin's 12: the oldest beyond that go.
+        if (files == null || files.length <= 36) return;
         Arrays.sort(files, (a, b) -> Long.compare(a.lastModified(), b.lastModified()));
-        for (int i = 0; i < files.length - 24; i++) {
+        for (int i = 0; i < files.length - 36; i++) {
             //noinspection ResultOfMethodCallIgnored
             files[i].delete();
         }
@@ -836,7 +897,7 @@ final class Recs {
         return out;
     }
 
-    private static String read(InputStream in) throws IOException {
+    static String read(InputStream in) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         byte[] buffer = new byte[8192];
         int n;

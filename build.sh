@@ -63,13 +63,25 @@ final class Config {
     static final boolean DISABLE_ASSISTANT = $ASSIST;
     static final boolean SHOW_CRYPTO = $CRYPTO;
     static final boolean HIDE_ANIMATION = $ANIMATION;
+    static final String JELLYFIN_URL = "$(prop jellyfin_url '')";
+    static final String JELLYFIN_TOKEN = "$(prop jellyfin_token '')";
 }
 EOF
+# Plain http is allowed only for a Jellyfin server given as http://<host>: servers at home rarely have https.
+JF_HOST="$(prop jellyfin_url '' | sed -nE 's#^http://([A-Za-z0-9.-]+).*#\1#p')"
+mkdir -p out/xml
+if [ -n "$JF_HOST" ]; then
+  printf '<network-security-config><domain-config cleartextTrafficPermitted="true"><domain>%s</domain></domain-config></network-security-config>\n' \
+    "$JF_HOST" > out/xml/network_security_config.xml
+else
+  echo '<network-security-config/>' > out/xml/network_security_config.xml
+fi
 
 # --- Build
 "$BT/aapt2" compile --dir app/res -o out/res.zip
+"$BT/aapt2" compile out/xml/network_security_config.xml -o out
 # Fonts uncompressed: Android reads them straight from the APK.
-"$BT/aapt2" link -o out/base.apk -I "$AJ" --manifest app/AndroidManifest.xml --java out/gen out/res.zip \
+"$BT/aapt2" link -o out/base.apk -I "$AJ" --manifest app/AndroidManifest.xml --java out/gen out/res.zip out/xml_network_security_config.xml.flat \
   --min-sdk-version 26 --target-sdk-version 33 -A app/assets -0 ttf
 # Windows aapt2 packs assets with backslash separators ("assets/symbols\x.png") and Android
 # cannot find them: the home screen loses its icons and fonts. Rename the zip entries to "/".
